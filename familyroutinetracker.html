@@ -1,0 +1,842 @@
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import {
+  Plus, Trash2, Camera, Check, X, Clock, Trophy, Users, User,
+  ChevronLeft, ChevronRight, Settings, ImageOff, Loader2, Award,
+  StickyNote, Sunrise, AlarmClockOff, CheckCircle2, XCircle, CircleDashed,
+  FileUp, FileText, AlertTriangle
+} from "lucide-react";
+
+// ---------- palette (navy & gold, matches Jayanth Mobile Service app) ----------
+const COL = {
+  bg: "#0B1220",
+  bgPanel: "#111B2E",
+  bgCard: "#16223A",
+  bgCardHover: "#1B2A47",
+  line: "#25334F",
+  gold: "#C9A227",
+  goldSoft: "#E9CE6B",
+  cream: "#F3EFE4",
+  creamDim: "#A9B3C7",
+  green: "#4CAF7D",
+  greenSoft: "rgba(76,175,125,0.15)",
+  red: "#D9634B",
+  redSoft: "rgba(217,99,75,0.15)",
+  amber: "#D8A657",
+  amberSoft: "rgba(216,166,87,0.15)",
+};
+
+const MEMBER_COLORS = ["#C9A227", "#4CAF7D", "#5B8DEF", "#D9634B", "#B07CC6", "#4BB8C9", "#D8A657"];
+const MEDALS = ["#E9CE6B", "#C9CDD6", "#CE8946"]; // gold, silver, bronze
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+const todayStr = (d = new Date()) => {
+  const dt = d;
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+};
+const fmtDateLabel = (dateStr) => {
+  const d = new Date(dateStr + "T00:00:00");
+  return d.toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" });
+};
+const minutesSinceMidnight = (date) => date.getHours() * 60 + date.getMinutes();
+const timeStrToMinutes = (t) => {
+  const [h, m] = t.split(":").map(Number);
+  return h * 60 + m;
+};
+const fmtTime12 = (t) => {
+  const [h, m] = t.split(":").map(Number);
+  const ap = h >= 12 ? "PM" : "AM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${String(m).padStart(2, "0")} ${ap}`;
+};
+const fmtStamp = (iso) => {
+  const d = new Date(iso);
+  return d.toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" });
+};
+
+// resize + compress a captured photo before saving
+const compressImage = (file) =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const maxW = 420;
+        const scale = Math.min(1, maxW / img.width);
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width * scale;
+        canvas.height = img.height * scale;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", 0.55));
+      };
+      img.onerror = reject;
+      img.src = reader.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+
+// ---------- PDF routine auto-import ----------
+let pdfjsLoadPromise = null;
+const loadPdfJs = () => {
+  if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  if (pdfjsLoadPromise) return pdfjsLoadPromise;
+  pdfjsLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    script.onload = () => {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+      resolve(window.pdfjsLib);
+    };
+    script.onerror = () => reject(new Error("Could not load PDF reader"));
+    document.body.appendChild(script);
+  });
+  return pdfjsLoadPromise;
+};
+
+const extractPdfText = async (file) => {
+  const pdfjsLib = await loadPdfJs();
+  const buf = await file.arrayBuffer();
+  const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+  let fullText = "";
+  for (let i = 1; i <= doc.numPages; i++) {
+    const page = await doc.getPage(i);
+    const content = await page.getTextContent();
+    // keep item order but insert line breaks between rows using their y position
+    let lastY = null;
+    let line = "";
+    content.items.forEach((it) => {
+      const y = it.transform[5];
+      if (lastY !== null && Math.abs(y - lastY) > 2) {
+        fullText += line.trim() + "\n";
+        line = "";
+      }
+      line += it.str + " ";
+      lastY = y;
+    });
+    fullText += line.trim() + "\n";
+  }
+  return fullText;
+};
+
+// turn a matched time token into 24-hour "HH:MM"
+const normalizeTime = (hh, mm, ap) => {
+  let h = parseInt(hh, 10);
+  const m = mm ? parseInt(mm, 10) : 0;
+  if (ap) {
+    const upper = ap.toUpperCase();
+    if (upper === "AM") { if (h === 12) h = 0; }
+    else if (upper === "PM") { if (h !== 12) h += 12; }
+  }
+  if (h > 23 || m > 59) return null;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+};
+
+const TIME_RE = /(\d{1,2})[:.](\d{2})\s*([AaPp]\.?[Mm]\.?)?/;
+
+// heuristic: scan each line for a time, treat the rest of the line as the task title
+const parseRoutineText = (text) => {
+  const lines = text.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+  const tasks = [];
+  lines.forEach((line) => {
+    const m = line.match(TIME_RE);
+    if (!m) return;
+    const time = normalizeTime(m[1], m[2], m[3]);
+    if (!time) return;
+    let title = (line.slice(0, m.index) + " " + line.slice(m.index + m[0].length))
+      .replace(/^[\s:.\-–—)]+|[\s:.\-–—(]+$/g, "")
+      .trim();
+    if (!title) title = "Routine task";
+    if (title.length > 60) title = title.slice(0, 60);
+    tasks.push({ id: uid(), time, title });
+  });
+  // de-duplicate same time+title, sort by time
+  const seen = new Set();
+  const unique = tasks.filter((t) => {
+    const key = t.time + "|" + t.title.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return unique.sort((a, b) => timeStrToMinutes(a.time) - timeStrToMinutes(b.time));
+};
+
+const DEFAULT_ROUTINE = [
+  { id: uid(), time: "06:00", title: "Wake up" },
+  { id: uid(), time: "06:30", title: "Exercise / Walk" },
+  { id: uid(), time: "09:00", title: "Breakfast" },
+  { id: uid(), time: "21:30", title: "Study / Reading" },
+  { id: uid(), time: "22:30", title: "Sleep" },
+];
+
+export default function FamilyRoutineTracker() {
+  const [ready, setReady] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [members, setMembers] = useState([]);
+  const [grace, setGrace] = useState(15); // minutes allowed after scheduled time to still count "present"
+  const [date, setDate] = useState(todayStr());
+  const [logs, setLogs] = useState({}); // memberId -> {taskId: {status,time,note,photo}}
+  const [now, setNow] = useState(new Date());
+  const [tab, setTab] = useState("today");
+  const [modal, setModal] = useState(null); // {memberId, task}
+  const [noteDraft, setNoteDraft] = useState("");
+  const [photoDraft, setPhotoDraft] = useState(null);
+  const [photoBusy, setPhotoBusy] = useState(false);
+  const [addMemberOpen, setAddMemberOpen] = useState(false);
+  const [newMemberName, setNewMemberName] = useState("");
+  const [pdfBusy, setPdfBusy] = useState(false);
+  const [pdfError, setPdfError] = useState("");
+  const [pdfFileName, setPdfFileName] = useState("");
+  const [pdfRoutine, setPdfRoutine] = useState(null);
+  const pdfInputRef = useRef(null);
+  const [taskDraft, setTaskDraft] = useState({}); // memberId -> {time,title}
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const fileRef = useRef(null);
+
+  const isToday = date === todayStr();
+
+  // ---------- load ----------
+  useEffect(() => {
+    (async () => {
+      try {
+        const m = await window.storage.get("members", true);
+        if (m?.value) setMembers(JSON.parse(m.value));
+      } catch (e) {}
+      try {
+        const s = await window.storage.get("settings", true);
+        if (s?.value) setGrace(JSON.parse(s.value).grace ?? 15);
+      } catch (e) {}
+      setReady(true);
+    })();
+  }, []);
+
+  const loadLogsForDate = useCallback(async (d, memberList) => {
+    const result = {};
+    for (const mem of memberList) {
+      try {
+        const r = await window.storage.get(`log:${d}:${mem.id}`, true);
+        result[mem.id] = r?.value ? JSON.parse(r.value) : {};
+      } catch (e) {
+        result[mem.id] = {};
+      }
+    }
+    setLogs(result);
+  }, []);
+
+  useEffect(() => {
+    if (ready && members.length) loadLogsForDate(date, members);
+    else if (ready) setLogs({});
+  }, [ready, date, members, loadLogsForDate]);
+
+  // ---------- ticking clock ----------
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 20000);
+    return () => clearInterval(t);
+  }, []);
+
+  const persistMembers = async (list) => {
+    setMembers(list);
+    try {
+      await window.storage.set("members", JSON.stringify(list), true);
+    } catch (e) {}
+  };
+  const persistSettings = async (g) => {
+    setGrace(g);
+    try {
+      await window.storage.set("settings", JSON.stringify({ grace: g }), true);
+    } catch (e) {}
+  };
+  const persistLog = async (memberId, taskEntry) => {
+    const updated = { ...(logs[memberId] || {}), ...taskEntry };
+    setLogs((prev) => ({ ...prev, [memberId]: updated }));
+    try {
+      await window.storage.set(`log:${date}:${memberId}`, JSON.stringify(updated), true);
+    } catch (e) {}
+  };
+
+  // ---------- status logic ----------
+  // returns: upcoming | due | present | late | absent
+  const statusFor = (member, task) => {
+    const entry = logs[member.id]?.[task.id];
+    const schedMin = timeStrToMinutes(task.time);
+    const nowMin = isToday ? minutesSinceMidnight(now) : 24 * 60; // past dates treated as "day over"
+    if (entry) return entry.status; // present / late / absent(manually?) already recorded
+    if (nowMin < schedMin) return "upcoming";
+    if (nowMin <= schedMin + grace) return "due";
+    return isToday ? "missed" : "absent"; // "missed" = window passed today, will lock in as absent next tick
+  };
+
+  // auto-lock missed tasks into "absent" once grace window fully passes, so results are permanent
+  useEffect(() => {
+    if (!isToday || !members.length) return;
+    members.forEach((mem) => {
+      mem.routine.forEach((task) => {
+        const st = statusFor(mem, task);
+        if (st === "missed" && !logs[mem.id]?.[task.id]) {
+          persistLog(mem.id, {
+            [task.id]: { status: "absent", time: null, note: "", photo: null },
+          });
+        }
+      });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [now, members, logs, isToday]);
+
+  const markPresent = async () => {
+    if (!modal) return;
+    const { memberId, task } = modal;
+    const schedMin = timeStrToMinutes(task.time);
+    const nowMin = minutesSinceMidnight(now);
+    const onTime = nowMin <= schedMin + grace;
+    setSaving(true);
+    await persistLog(memberId, {
+      [task.id]: {
+        status: onTime ? "present" : "late",
+        time: now.toISOString(),
+        note: noteDraft.trim(),
+        photo: photoDraft,
+      },
+    });
+    setSaving(false);
+    setModal(null);
+    setNoteDraft("");
+    setPhotoDraft(null);
+  };
+
+  const handlePhotoPick = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setPhotoBusy(true);
+    try {
+      const compressed = await compressImage(file);
+      setPhotoDraft(compressed);
+    } catch (e) {}
+    setPhotoBusy(false);
+  };
+
+  const addMember = async () => {
+    const name = newMemberName.trim();
+    if (!name) return;
+    const color = MEMBER_COLORS[members.length % MEMBER_COLORS.length];
+    const routine = pdfRoutine && pdfRoutine.length ? pdfRoutine : DEFAULT_ROUTINE.map((t) => ({ ...t, id: uid() }));
+    const list = [...members, { id: uid(), name, color, routine }];
+    await persistMembers(list);
+    setNewMemberName("");
+    setPdfRoutine(null);
+    setPdfFileName("");
+    setPdfError("");
+    setAddMemberOpen(false);
+  };
+
+  const handlePdfPick = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setPdfFileName(file.name);
+    setPdfBusy(true);
+    setPdfError("");
+    setPdfRoutine(null);
+    try {
+      const text = await extractPdfText(file);
+      const tasks = parseRoutineText(text);
+      if (tasks.length === 0) {
+        setPdfError("No time-based routine lines found in this PDF. Add tasks manually after creating the member.");
+      } else {
+        setPdfRoutine(tasks);
+      }
+    } catch (err) {
+      setPdfError("Couldn't read that PDF. Add tasks manually after creating the member.");
+    }
+    setPdfBusy(false);
+  };
+
+  const removeMember = async (id) => {
+    await persistMembers(members.filter((m) => m.id !== id));
+  };
+
+  const addTask = async (memberId) => {
+    const d = taskDraft[memberId];
+    if (!d?.time || !d?.title?.trim()) return;
+    const list = members.map((m) =>
+      m.id === memberId
+        ? { ...m, routine: [...m.routine, { id: uid(), time: d.time, title: d.title.trim() }].sort((a, b) => timeStrToMinutes(a.time) - timeStrToMinutes(b.time)) }
+        : m
+    );
+    await persistMembers(list);
+    setTaskDraft((p) => ({ ...p, [memberId]: { time: "", title: "" } }));
+  };
+
+  const removeTask = async (memberId, taskId) => {
+    const list = members.map((m) => (m.id === memberId ? { ...m, routine: m.routine.filter((t) => t.id !== taskId) } : m));
+    await persistMembers(list);
+  };
+
+  // ---------- ranking ----------
+  const memberStats = members.map((m) => {
+    const total = m.routine.length;
+    let present = 0, late = 0, absent = 0, pending = 0;
+    m.routine.forEach((t) => {
+      const st = statusFor(m, t);
+      if (st === "present") present++;
+      else if (st === "late") late++;
+      else if (st === "absent") absent++;
+      else pending++;
+    });
+    const decided = present + late + absent;
+    const pct = total ? Math.round((present / total) * 100) : 0;
+    return { member: m, total, present, late, absent, pending, decided, pct };
+  });
+  const ranked = [...memberStats].sort((a, b) => b.present - a.present || b.pct - a.pct || a.late - b.late);
+
+  // persist a lightweight daily summary whenever today's ranking changes (for history)
+  useEffect(() => {
+    if (!isToday || !members.length) return;
+    const allDecided = memberStats.every((s) => s.decided === s.total && s.total > 0);
+    if (!allDecided) return;
+    const summary = ranked.map((r) => ({ id: r.member.id, name: r.member.name, present: r.present, total: r.total, pct: r.pct }));
+    window.storage.set(`summary:${date}`, JSON.stringify(summary), true).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [logs]);
+
+  const statusStyle = (st) => {
+    switch (st) {
+      case "present": return { bg: COL.greenSoft, fg: COL.green, label: "Present", icon: CheckCircle2 };
+      case "late": return { bg: COL.amberSoft, fg: COL.amber, label: "Late (Fail)", icon: AlarmClockOff };
+      case "absent": return { bg: COL.redSoft, fg: COL.red, label: "Absent", icon: XCircle };
+      case "due": return { bg: COL.amberSoft, fg: COL.goldSoft, label: "Mark now", icon: Clock };
+      default: return { bg: "transparent", fg: COL.creamDim, label: "Upcoming", icon: CircleDashed };
+    }
+  };
+
+  const shiftDate = (delta) => {
+    const d = new Date(date + "T00:00:00");
+    d.setDate(d.getDate() + delta);
+    const next = todayStr(d);
+    if (next > todayStr()) return;
+    setDate(next);
+  };
+
+  if (!ready) {
+    return (
+      <div style={{ background: COL.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: COL.cream }}>
+        <Loader2 className="animate-spin" size={28} />
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ background: COL.bg, minHeight: "100vh", color: COL.cream, fontFamily: "'Segoe UI', system-ui, sans-serif", paddingBottom: 90 }}>
+      <style>{`
+        * { box-sizing: border-box; }
+        button { font-family: inherit; cursor: pointer; }
+        input, textarea { font-family: inherit; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-thumb { background: ${COL.line}; border-radius: 4px; }
+        @keyframes fadeUp { from { opacity:0; transform: translateY(6px);} to {opacity:1; transform:translateY(0);} }
+      `}</style>
+
+      {/* Header */}
+      <div style={{ background: `linear-gradient(180deg, ${COL.bgPanel}, ${COL.bg})`, borderBottom: `1px solid ${COL.line}`, padding: "22px 18px 16px" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ width: 38, height: 38, borderRadius: 10, background: COL.bgCard, border: `1px solid ${COL.gold}`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <Sunrise size={20} color={COL.gold} />
+            </div>
+            <div>
+              <div style={{ fontSize: 18, fontWeight: 700, letterSpacing: 0.3, color: COL.goldSoft, fontFamily: "Georgia, serif" }}>Family Routine</div>
+              <div style={{ fontSize: 11, color: COL.creamDim }}>Daily discipline, tracked honestly</div>
+            </div>
+          </div>
+          <button onClick={() => setSettingsOpen(true)} style={{ background: COL.bgCard, border: `1px solid ${COL.line}`, borderRadius: 10, padding: 8 }}>
+            <Settings size={18} color={COL.creamDim} />
+          </button>
+        </div>
+
+        {/* date nav */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 16, background: COL.bgCard, borderRadius: 12, padding: "8px 10px", border: `1px solid ${COL.line}` }}>
+          <button onClick={() => shiftDate(-1)} style={{ background: "transparent", border: "none", padding: 6 }}>
+            <ChevronLeft size={18} color={COL.creamDim} />
+          </button>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 14, fontWeight: 600 }}>{fmtDateLabel(date)}{isToday ? " · Today" : ""}</div>
+            <div style={{ fontSize: 11, color: COL.creamDim }}>
+              {isToday ? now.toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" }) : "Past day (locked)"}
+            </div>
+          </div>
+          <button onClick={() => shiftDate(1)} disabled={isToday} style={{ background: "transparent", border: "none", padding: 6, opacity: isToday ? 0.3 : 1 }}>
+            <ChevronRight size={18} color={COL.creamDim} />
+          </button>
+        </div>
+      </div>
+
+      {/* Tabs content */}
+      <div style={{ padding: "16px 14px", maxWidth: 640, margin: "0 auto" }}>
+        {members.length === 0 && (
+          <EmptyState onAdd={() => setAddMemberOpen(true)} />
+        )}
+
+        {tab === "today" && members.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            {members.map((m) => (
+              <MemberDay key={m.id} member={m} statusFor={statusFor} statusStyle={statusStyle} logs={logs} onMark={(task) => { setModal({ memberId: m.id, task }); setNoteDraft(""); setPhotoDraft(null); }} isToday={isToday} />
+            ))}
+          </div>
+        )}
+
+        {tab === "dashboard" && (
+          <Dashboard ranked={ranked} isToday={isToday} date={date} />
+        )}
+
+        {tab === "members" && (
+          <MembersTab
+            members={members}
+            taskDraft={taskDraft}
+            setTaskDraft={setTaskDraft}
+            addTask={addTask}
+            removeTask={removeTask}
+            removeMember={removeMember}
+            onAddMember={() => setAddMemberOpen(true)}
+          />
+        )}
+      </div>
+
+      {/* Bottom nav */}
+      <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, background: COL.bgPanel, borderTop: `1px solid ${COL.line}`, display: "flex", padding: "8px 10px calc(8px + env(safe-area-inset-bottom))", gap: 6 }}>
+        {[
+          { key: "today", label: "Today", icon: Clock },
+          { key: "dashboard", label: "Dashboard", icon: Trophy },
+          { key: "members", label: "Family", icon: Users },
+        ].map((t) => {
+          const Icon = t.icon;
+          const active = tab === t.key;
+          return (
+            <button key={t.key} onClick={() => setTab(t.key)} style={{
+              flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3,
+              background: active ? COL.bgCard : "transparent", border: `1px solid ${active ? COL.gold : "transparent"}`,
+              borderRadius: 12, padding: "8px 0", color: active ? COL.goldSoft : COL.creamDim,
+            }}>
+              <Icon size={18} />
+              <span style={{ fontSize: 11, fontWeight: active ? 600 : 400 }}>{t.label}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Mark present modal */}
+      {modal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "flex-end", zIndex: 50 }} onClick={() => setModal(null)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: COL.bgPanel, width: "100%", borderRadius: "18px 18px 0 0", padding: 20, border: `1px solid ${COL.line}`, animation: "fadeUp 0.15s ease" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <div style={{ fontSize: 16, fontWeight: 700 }}>{modal.task.title}</div>
+              <button onClick={() => setModal(null)} style={{ background: "transparent", border: "none" }}><X size={20} color={COL.creamDim} /></button>
+            </div>
+            <div style={{ fontSize: 12, color: COL.creamDim, marginBottom: 16 }}>
+              Scheduled {fmtTime12(modal.task.time)} · Now {now.toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" })}
+            </div>
+
+            <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+              <button onClick={() => fileRef.current?.click()} style={{
+                flex: 1, background: COL.bgCard, border: `1px dashed ${COL.line}`, borderRadius: 12, padding: "14px 8px",
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 6, color: COL.creamDim,
+              }}>
+                {photoBusy ? <Loader2 className="animate-spin" size={20} /> : photoDraft ? (
+                  <img src={photoDraft} alt="proof" style={{ width: 60, height: 60, objectFit: "cover", borderRadius: 8 }} />
+                ) : <Camera size={20} />}
+                <span style={{ fontSize: 11 }}>{photoDraft ? "Change photo" : "Add photo proof (optional)"}</span>
+              </button>
+              <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={handlePhotoPick} />
+            </div>
+
+            <textarea
+              value={noteDraft}
+              onChange={(e) => setNoteDraft(e.target.value)}
+              placeholder="Note (optional)..."
+              rows={2}
+              style={{ width: "100%", background: COL.bgCard, border: `1px solid ${COL.line}`, borderRadius: 10, padding: 10, color: COL.cream, fontSize: 13, resize: "none", marginBottom: 14 }}
+            />
+
+            <button onClick={markPresent} disabled={saving} style={{
+              width: "100%", background: COL.gold, color: "#12100a", border: "none", borderRadius: 12, padding: "13px 0",
+              fontSize: 15, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+            }}>
+              {saving ? <Loader2 className="animate-spin" size={18} /> : <Check size={18} />}
+              Mark attendance now
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Add member modal */}
+      {addMemberOpen && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50 }} onClick={() => setAddMemberOpen(false)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: COL.bgPanel, width: "88%", maxWidth: 380, maxHeight: "82vh", overflowY: "auto", borderRadius: 16, padding: 20, border: `1px solid ${COL.line}` }}>
+            <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>Add family member</div>
+            <input
+              value={newMemberName}
+              onChange={(e) => setNewMemberName(e.target.value)}
+              placeholder="Name"
+              style={{ width: "100%", background: COL.bgCard, border: `1px solid ${COL.line}`, borderRadius: 10, padding: 11, color: COL.cream, fontSize: 14, marginBottom: 14 }}
+            />
+
+            <div style={{ fontSize: 12, color: COL.creamDim, marginBottom: 8 }}>Routine</div>
+            <button onClick={() => pdfInputRef.current?.click()} style={{
+              width: "100%", background: COL.bgCard, border: `1px dashed ${COL.line}`, borderRadius: 12, padding: "14px 10px",
+              display: "flex", alignItems: "center", gap: 10, color: COL.creamDim, marginBottom: 8,
+            }}>
+              {pdfBusy ? <Loader2 className="animate-spin" size={20} color={COL.gold} /> : <FileUp size={20} color={COL.gold} />}
+              <div style={{ textAlign: "left", flex: 1 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: COL.cream }}>
+                  {pdfBusy ? "Reading PDF..." : pdfFileName ? pdfFileName : "Upload PDF timetable (auto-fill)"}
+                </div>
+                <div style={{ fontSize: 10.5, color: COL.creamDim }}>Times + tasks are read automatically</div>
+              </div>
+            </button>
+            <input ref={pdfInputRef} type="file" accept="application/pdf" style={{ display: "none" }} onChange={handlePdfPick} />
+
+            {pdfError && (
+              <div style={{ display: "flex", gap: 6, alignItems: "flex-start", fontSize: 11.5, color: COL.amber, marginBottom: 10 }}>
+                <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 1 }} /> {pdfError}
+              </div>
+            )}
+
+            {pdfRoutine && pdfRoutine.length > 0 && (
+              <div style={{ background: COL.bgCard, border: `1px solid ${COL.line}`, borderRadius: 10, padding: 10, marginBottom: 10 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 700, color: COL.green, marginBottom: 6 }}>
+                  <FileText size={14} /> {pdfRoutine.length} tasks found — review below
+                </div>
+                {pdfRoutine.map((t) => (
+                  <div key={t.id} style={{ display: "flex", gap: 8, fontSize: 12, padding: "3px 0", color: COL.creamDim }}>
+                    <span style={{ width: 60, color: COL.goldSoft, fontVariantNumeric: "tabular-nums" }}>{fmtTime12(t.time)}</span>
+                    <span>{t.title}</span>
+                  </div>
+                ))}
+                <div style={{ fontSize: 10.5, color: COL.creamDim, marginTop: 6 }}>You can edit these anytime from the Family tab.</div>
+              </div>
+            )}
+
+            {!pdfRoutine && !pdfBusy && (
+              <div style={{ fontSize: 11, color: COL.creamDim, marginBottom: 10 }}>No PDF? A starter routine (wake up, exercise, breakfast, study, sleep) will be added — edit it later.</div>
+            )}
+
+            <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
+              <button onClick={() => { setAddMemberOpen(false); setPdfRoutine(null); setPdfFileName(""); setPdfError(""); }} style={{ flex: 1, background: "transparent", border: `1px solid ${COL.line}`, borderRadius: 10, padding: "10px 0", color: COL.creamDim }}>Cancel</button>
+              <button onClick={addMember} style={{ flex: 1, background: COL.gold, border: "none", borderRadius: 10, padding: "10px 0", color: "#12100a", fontWeight: 700 }}>Add</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Settings modal */}
+      {settingsOpen && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50 }} onClick={() => setSettingsOpen(false)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: COL.bgPanel, width: "88%", maxWidth: 360, borderRadius: 16, padding: 20, border: `1px solid ${COL.line}` }}>
+            <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 6 }}>Grace period</div>
+            <div style={{ fontSize: 12, color: COL.creamDim, marginBottom: 14 }}>
+              Minutes allowed after scheduled time to still count as "Present". Marking after this window counts as fail.
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
+              {[0, 5, 10, 15, 30].map((g) => (
+                <button key={g} onClick={() => persistSettings(g)} style={{
+                  padding: "8px 14px", borderRadius: 10, border: `1px solid ${grace === g ? COL.gold : COL.line}`,
+                  background: grace === g ? COL.amberSoft : COL.bgCard, color: grace === g ? COL.goldSoft : COL.creamDim, fontSize: 13, fontWeight: 600,
+                }}>{g} min</button>
+              ))}
+            </div>
+            <button onClick={() => setSettingsOpen(false)} style={{ width: "100%", background: COL.gold, border: "none", borderRadius: 10, padding: "10px 0", color: "#12100a", fontWeight: 700 }}>Done</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EmptyState({ onAdd }) {
+  return (
+    <div style={{ textAlign: "center", padding: "50px 20px" }}>
+      <Users size={34} color={COL.gold} style={{ marginBottom: 12 }} />
+      <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>No family members yet</div>
+      <div style={{ fontSize: 13, color: COL.creamDim, marginBottom: 18 }}>Add each person and their daily routine to start tracking.</div>
+      <button onClick={onAdd} style={{ background: COL.gold, border: "none", borderRadius: 12, padding: "12px 22px", color: "#12100a", fontWeight: 700, display: "inline-flex", alignItems: "center", gap: 8 }}>
+        <Plus size={18} /> Add member
+      </button>
+    </div>
+  );
+}
+
+function MemberDay({ member, statusFor, statusStyle, logs, onMark, isToday }) {
+  const [open, setOpen] = useState(true);
+  const stats = { present: 0, late: 0, absent: 0, pending: 0 };
+  member.routine.forEach((t) => {
+    const st = statusFor(member, t);
+    if (st === "present") stats.present++;
+    else if (st === "late") stats.late++;
+    else if (st === "absent") stats.absent++;
+    else stats.pending++;
+  });
+
+  return (
+    <div style={{ background: COL.bgPanel, border: `1px solid ${COL.line}`, borderRadius: 16, overflow: "hidden" }}>
+      <button onClick={() => setOpen((o) => !o)} style={{ width: "100%", background: "transparent", border: "none", padding: "14px 16px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ width: 34, height: 34, borderRadius: "50%", background: member.color, display: "flex", alignItems: "center", justifyContent: "center", color: "#12100a", fontWeight: 700, fontSize: 13 }}>
+            {member.name.slice(0, 1).toUpperCase()}
+          </div>
+          <div style={{ textAlign: "left" }}>
+            <div style={{ fontSize: 14, fontWeight: 700 }}>{member.name}</div>
+            <div style={{ fontSize: 11, color: COL.creamDim }}>
+              {stats.present} present · {stats.late + stats.absent} fail · {stats.pending} pending
+            </div>
+          </div>
+        </div>
+        <ChevronRight size={16} color={COL.creamDim} style={{ transform: open ? "rotate(90deg)" : "none", transition: "transform 0.15s" }} />
+      </button>
+
+      {open && (
+        <div style={{ borderTop: `1px solid ${COL.line}` }}>
+          {member.routine.length === 0 && (
+            <div style={{ padding: 16, fontSize: 12, color: COL.creamDim }}>No routine tasks added yet.</div>
+          )}
+          {member.routine.map((task) => {
+            const st = statusFor(member, task);
+            const entry = logs[member.id]?.[task.id];
+            const s = statusStyle(st);
+            const Icon = s.icon;
+            const canMark = isToday && (st === "due" || st === "upcoming");
+            return (
+              <div key={task.id} style={{ padding: "12px 16px", borderBottom: `1px solid ${COL.line}`, display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ width: 54, fontSize: 12, color: COL.creamDim, fontVariantNumeric: "tabular-nums" }}>{fmtTime12(task.time)}</div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 13.5, fontWeight: 600 }}>{task.title}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 3 }}>
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, padding: "2px 8px", borderRadius: 20, background: s.bg, color: s.fg, fontWeight: 600 }}>
+                      <Icon size={12} /> {s.label}{entry?.time ? ` · ${fmtStamp(entry.time)}` : ""}
+                    </span>
+                    {entry?.photo && <Camera size={13} color={COL.creamDim} />}
+                    {entry?.note && <StickyNote size={13} color={COL.creamDim} />}
+                  </div>
+                  {entry?.note && <div style={{ fontSize: 11.5, color: COL.creamDim, marginTop: 4, fontStyle: "italic" }}>"{entry.note}"</div>}
+                  {entry?.photo && (
+                    <img src={entry.photo} alt="proof" style={{ width: 46, height: 46, borderRadius: 8, objectFit: "cover", marginTop: 6 }} />
+                  )}
+                </div>
+                {canMark && (
+                  <button onClick={() => onMark(task)} style={{
+                    background: st === "due" ? COL.gold : COL.bgCard, color: st === "due" ? "#12100a" : COL.creamDim,
+                    border: `1px solid ${st === "due" ? COL.gold : COL.line}`, borderRadius: 10, padding: "8px 12px", fontSize: 12, fontWeight: 700, whiteSpace: "nowrap",
+                  }}>
+                    Mark present
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Dashboard({ ranked, isToday, date }) {
+  const podium = ranked.slice(0, 3);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+      {podium.length > 0 && podium[0].total > 0 && (
+        <div style={{ background: COL.bgPanel, border: `1px solid ${COL.line}`, borderRadius: 16, padding: "20px 16px", textAlign: "center" }}>
+          <div style={{ fontSize: 12, color: COL.creamDim, marginBottom: 14, letterSpacing: 0.5 }}>
+            {isToday ? "TODAY'S RESULT" : fmtDateLabel(date).toUpperCase()}
+          </div>
+          <div style={{ display: "flex", justifyContent: "center", alignItems: "flex-end", gap: 14 }}>
+            {[podium[1], podium[0], podium[2]].map((r, i) => {
+              if (!r) return <div key={i} style={{ width: 70 }} />;
+              const rank = i === 1 ? 1 : i === 0 ? 2 : 3;
+              const height = rank === 1 ? 92 : rank === 2 ? 70 : 54;
+              return (
+                <div key={r.member.id} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+                  <div style={{ width: 44, height: 44, borderRadius: "50%", background: r.member.color, display: "flex", alignItems: "center", justifyContent: "center", color: "#12100a", fontWeight: 700, border: `2px solid ${MEDALS[rank - 1]}` }}>
+                    {r.member.name.slice(0, 1).toUpperCase()}
+                  </div>
+                  <div style={{ fontSize: 12, fontWeight: 700 }}>{r.member.name}</div>
+                  <div style={{ fontSize: 11, color: COL.creamDim }}>{r.present}/{r.total} · {r.pct}%</div>
+                  <div style={{ width: 54, height, background: `linear-gradient(180deg, ${MEDALS[rank - 1]}, ${COL.bgCard})`, borderRadius: "8px 8px 0 0", display: "flex", alignItems: "flex-start", justifyContent: "center", paddingTop: 6 }}>
+                    <Trophy size={16} color="#12100a" />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {ranked.map((r, i) => (
+          <div key={r.member.id} style={{ background: COL.bgPanel, border: `1px solid ${COL.line}`, borderRadius: 14, padding: "12px 14px", display: "flex", alignItems: "center", gap: 12 }}>
+            <div style={{ width: 24, textAlign: "center", fontSize: 13, fontWeight: 700, color: i < 3 ? MEDALS[i] : COL.creamDim }}>{i + 1}</div>
+            <div style={{ width: 32, height: 32, borderRadius: "50%", background: r.member.color, display: "flex", alignItems: "center", justifyContent: "center", color: "#12100a", fontWeight: 700, fontSize: 12 }}>
+              {r.member.name.slice(0, 1).toUpperCase()}
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 13.5, fontWeight: 600 }}>{r.member.name}</div>
+              <div style={{ height: 6, background: COL.bgCard, borderRadius: 4, marginTop: 5, overflow: "hidden" }}>
+                <div style={{ width: `${r.pct}%`, height: "100%", background: r.pct >= 70 ? COL.green : r.pct >= 40 ? COL.amber : COL.red }} />
+              </div>
+            </div>
+            <div style={{ textAlign: "right", fontSize: 11, color: COL.creamDim, minWidth: 70 }}>
+              <div style={{ color: COL.green, fontWeight: 700, fontSize: 13 }}>{r.present} present</div>
+              <div>{r.late + r.absent} fail · {r.pending} left</div>
+            </div>
+          </div>
+        ))}
+        {ranked.length === 0 && (
+          <div style={{ textAlign: "center", padding: 30, color: COL.creamDim, fontSize: 13 }}>Add members and routines to see results here.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MembersTab({ members, taskDraft, setTaskDraft, addTask, removeTask, removeMember, onAddMember }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      {members.map((m) => (
+        <div key={m.id} style={{ background: COL.bgPanel, border: `1px solid ${COL.line}`, borderRadius: 16, padding: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ width: 30, height: 30, borderRadius: "50%", background: m.color, display: "flex", alignItems: "center", justifyContent: "center", color: "#12100a", fontWeight: 700, fontSize: 12 }}>
+                {m.name.slice(0, 1).toUpperCase()}
+              </div>
+              <div style={{ fontSize: 14, fontWeight: 700 }}>{m.name}</div>
+            </div>
+            <button onClick={() => removeMember(m.id)} style={{ background: "transparent", border: "none" }}>
+              <Trash2 size={16} color={COL.red} />
+            </button>
+          </div>
+
+          {m.routine.map((t) => (
+            <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 0", borderTop: `1px solid ${COL.line}` }}>
+              <div style={{ width: 60, fontSize: 12, color: COL.creamDim }}>{fmtTime12(t.time)}</div>
+              <div style={{ flex: 1, fontSize: 13 }}>{t.title}</div>
+              <button onClick={() => removeTask(m.id, t.id)} style={{ background: "transparent", border: "none" }}>
+                <X size={15} color={COL.creamDim} />
+              </button>
+            </div>
+          ))}
+
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <input type="time" value={taskDraft[m.id]?.time || ""} onChange={(e) => setTaskDraft((p) => ({ ...p, [m.id]: { ...p[m.id], time: e.target.value } }))}
+              style={{ width: 96, background: COL.bgCard, border: `1px solid ${COL.line}`, borderRadius: 8, padding: 8, color: COL.cream, fontSize: 12 }} />
+            <input placeholder="Task name" value={taskDraft[m.id]?.title || ""} onChange={(e) => setTaskDraft((p) => ({ ...p, [m.id]: { ...p[m.id], title: e.target.value } }))}
+              style={{ flex: 1, background: COL.bgCard, border: `1px solid ${COL.line}`, borderRadius: 8, padding: 8, color: COL.cream, fontSize: 12 }} />
+            <button onClick={() => addTask(m.id)} style={{ background: COL.gold, border: "none", borderRadius: 8, padding: "0 12px", color: "#12100a" }}>
+              <Plus size={16} />
+            </button>
+          </div>
+        </div>
+      ))}
+
+      <button onClick={onAddMember} style={{ background: COL.bgCard, border: `1px dashed ${COL.line}`, borderRadius: 14, padding: "14px 0", color: COL.creamDim, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 13, fontWeight: 600 }}>
+        <Plus size={16} /> Add family member
+      </button>
+    </div>
+  );
+}
